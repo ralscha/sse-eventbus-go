@@ -1,0 +1,92 @@
+version: '3'
+
+vars:
+  COVERAGE_FILE: coverage.out
+  COVERAGE_HTML: coverage.html
+
+tasks:
+  default:
+    desc: List all available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  format:
+    desc: Format all Go source files
+    cmds:
+      - go fix ./...
+      - go fmt ./...
+
+  test:
+    desc: Run all tests
+    cmds:
+      - go test ./...
+
+  lint:
+    desc: Run golangci-lint in a Docker container
+    cmds:
+      - docker run --rm -v {{toSlash .ROOT_DIR}}:/app -w /app golangci/golangci-lint:v2.12.2 golangci-lint run -v --timeout 5m
+
+  deps:
+    desc: Download and verify module dependencies
+    cmds:
+      - go mod download
+      - go mod verify
+
+  tidy:
+    desc: Update go.mod and go.sum
+    cmds:
+      - go mod tidy
+
+  build:
+    desc: Build all packages
+    cmds:
+      - go build ./...
+
+  vet:
+    desc: Run the Go static analyzer
+    cmds:
+      - go vet ./...
+
+  test-uncached:
+    desc: Run all tests without using cached results
+    cmds:
+      - go test -count=1 ./...
+
+  test-race:
+    desc: Run all tests with the race detector
+    cmds:
+      - go test -race ./...
+
+  coverage:
+    desc: Run tests and write an atomic coverage profile
+    cmds:
+      - go test -covermode=atomic -coverprofile={{.COVERAGE_FILE}} ./...
+
+  coverage-html:
+    desc: Generate an HTML coverage report
+    deps:
+      - coverage
+    cmds:
+      - go tool cover -html={{.COVERAGE_FILE}} -o {{.COVERAGE_HTML}}
+
+  verify:
+    desc: Build and run all standard Go verification checks
+    cmds:
+      - task: deps
+      - task: vet
+      - task: test-uncached
+      - task: test-race
+      - task: build
+
+  ci:
+    desc: Run the complete verification and lint suite
+    cmds:
+      - task: verify
+      - task: lint
+
+  clean:
+    desc: Remove test caches and generated coverage reports
+    cmds:
+      - go clean -testcache
+      - '{{if eq OS "windows"}}powershell -NoProfile -Command "Remove-Item -Force -ErrorAction SilentlyContinue ''{{.COVERAGE_FILE}}'', ''{{.COVERAGE_HTML}}''"{{else}}rm -f {{.COVERAGE_FILE}} {{.COVERAGE_HTML}}{{end}}'
