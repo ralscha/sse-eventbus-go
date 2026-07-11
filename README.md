@@ -8,6 +8,12 @@ core and a standard-library adapter.
 The core has no third-party dependencies. A custom HTTP framework only needs to
 implement the small `Connection` interface.
 
+## Demos
+
+- [Basic ECharts demo](https://github.com/ralscha/sse-eventbug-go-demo)
+- [Ionic/Angular chat demo](https://github.com/ralscha/sse-eventbug-go-demo-chat)
+- [Distributed Valkey demo](https://github.com/ralscha/sse-eventbug-go-demo-distributed)
+
 ## Getting started
 
 Every connecting client must send a non-empty ID that uniquely identifies its
