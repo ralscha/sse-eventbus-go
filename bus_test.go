@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -374,6 +375,16 @@ func TestAsyncRetryExhaustion(t *testing.T) {
 	if bus.IsClientRegistered("c") {
 		t.Fatal("client was not removed after retry exhaustion")
 	}
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		listener.mu.Lock()
+		notified := len(listener.removed) > 0
+		listener.mu.Unlock()
+		if notified {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	listener.mu.Lock()
 	defer listener.mu.Unlock()
 	if len(listener.retries) < 2 || !listener.retries[0] || listener.retries[1] {
@@ -443,7 +454,7 @@ func TestStaleRemovalDoesNotRemoveRefreshedClient(t *testing.T) {
 	registered := bus.clients["c"]
 	bus.mu.RUnlock()
 	registered.touch()
-	if bus.unregister("c", &cutoff, false) {
+	if bus.unregister("c", nil, &cutoff, false) {
 		t.Fatal("refreshed client was removed as stale")
 	}
 	if !bus.IsClientRegistered("c") {
@@ -566,9 +577,287 @@ func TestConverterHeartbeatAndExpiration(t *testing.T) {
 	if expireBus.IsClientRegistered("c") {
 		t.Fatal("client did not expire")
 	}
+	deadline = time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		listener.mu.Lock()
+		notified := len(listener.removed) > 0
+		listener.mu.Unlock()
+		if notified {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	listener.mu.Lock()
 	defer listener.mu.Unlock()
 	if !reflect.DeepEqual(listener.removed, []string{"c"}) {
 		t.Fatalf("expiration callback=%v", listener.removed)
+	}
+}
+
+func TestRetryQueueCapacityOneDoesNotDeadlockScheduler(t *testing.T) {
+	bus, err := New(
+		WithQueueCapacities(10, 1),
+		WithSendAttempts(2),
+		WithSchedulerDelay(5*time.Millisecond),
+		WithRetryBackoff(30*time.Millisecond, 30*time.Millisecond),
+		WithoutClientExpiration(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = bus.Close(ctx)
+	})
+	connection := &recordingConnection{failures: 100}
+	if err := bus.Register("c", connection, SubscribeTo("orders")); err != nil {
+		t.Fatal(err)
+	}
+	for _, data := range []string{"one", "two"} {
+		if err := bus.Publish(context.Background(), NewNamedEventWithData("orders", data)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for bus.IsClientRegistered("c") && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if bus.IsClientRegistered("c") {
+		t.Fatal("retry scheduler stalled with a full capacity-one retry queue")
+	}
+}
+
+func TestStaleQueuedEventCannotUnregisterReplacement(t *testing.T) {
+	bus, err := New(WithoutClientExpiration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	if err := bus.Register("c", &recordingConnection{}, SubscribeTo("orders")); err != nil {
+		t.Fatal(err)
+	}
+	bus.mu.RLock()
+	old := bus.clients["c"]
+	bus.mu.RUnlock()
+	if !bus.Unregister("c") {
+		t.Fatal("old client was not unregistered")
+	}
+	replacement := &recordingConnection{}
+	if err := bus.Register("c", replacement, SubscribeTo("orders")); err != nil {
+		t.Fatal(err)
+	}
+	stale := &ClientEvent{ClientID: "c", Event: NewNamedEventWithData("orders", "stale"), Message: Message{Event: "orders", Data: "stale", HasData: true}, client: old}
+	stale.attempts.Store(int32(bus.config.attempts))
+	if err := bus.sendQueue.push(context.Background(), stale); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for bus.SendQueueSize() != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !bus.IsClientRegistered("c") {
+		t.Fatal("stale work unregistered the replacement client")
+	}
+	if messages := replacement.snapshot(); len(messages) != 0 {
+		t.Fatalf("replacement received stale messages: %#v", messages)
+	}
+}
+
+type blockingConverter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (*blockingConverter) Supports(Event) bool { return true }
+func (c *blockingConverter) Convert(Event) (string, error) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return "converted", nil
+}
+
+func TestPublishCannotEnqueueAfterClose(t *testing.T) {
+	converter := &blockingConverter{entered: make(chan struct{}), release: make(chan struct{})}
+	bus, err := New(WithConverters(converter), WithoutClientExpiration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Register("c", &recordingConnection{}, SubscribeTo("orders")); err != nil {
+		t.Fatal(err)
+	}
+	published := make(chan error, 1)
+	go func() { published <- bus.Publish(context.Background(), NewNamedEventWithData("orders", struct{}{})) }()
+	select {
+	case <-converter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("conversion did not start")
+	}
+	if err := bus.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(converter.release)
+	if err := <-published; !errors.Is(err, ErrClosed) {
+		t.Fatalf("Publish error=%v, want ErrClosed", err)
+	}
+	if size := bus.SendQueueSize(); size != 0 {
+		t.Fatalf("closed bus retained %d newly queued events", size)
+	}
+}
+
+type sliceConnection []int
+
+func (sliceConnection) Send(Message) error { return nil }
+func (c sliceConnection) Close() error {
+	c[0]++
+	return nil
+}
+
+func TestReconnectAcceptsNonComparableConnection(t *testing.T) {
+	bus := newSyncBus(t)
+	connection := sliceConnection{0}
+	if err := bus.Register("c", connection); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Register("c", connection); err != nil {
+		t.Fatal(err)
+	}
+	if connection[0] != 0 {
+		t.Fatal("re-registering the same non-comparable connection closed it")
+	}
+}
+
+type gatedCountingConnection struct {
+	mu      sync.Mutex
+	calls   int
+	closed  bool
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedCountingConnection) Send(Message) error {
+	c.mu.Lock()
+	c.calls++
+	call := c.calls
+	c.mu.Unlock()
+	if call == 1 {
+		close(c.started)
+		<-c.release
+	}
+	return nil
+}
+func (c *gatedCountingConnection) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	return nil
+}
+func (c *gatedCountingConnection) snapshot() (int, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calls, c.closed
+}
+
+func TestCompleteAfterMessageSerializesConcurrentWorkers(t *testing.T) {
+	bus, err := New(WithWorkerCount(2), WithoutClientExpiration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	connection := &gatedCountingConnection{started: make(chan struct{}), release: make(chan struct{})}
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(connection.release) }) })
+	if err := bus.Register("c", connection, SubscribeTo("orders"), CompleteAfterMessage()); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(context.Background(), NewNamedEventWithData("orders", "first")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-connection.started:
+	case <-time.After(time.Second):
+		t.Fatal("first send did not start")
+	}
+	if err := bus.Publish(context.Background(), NewNamedEventWithData("orders", "second")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if calls, _ := connection.snapshot(); calls != 1 {
+		t.Fatalf("%d sends entered before complete-after-message closed the connection", calls)
+	}
+	releaseOnce.Do(func() { close(connection.release) })
+	deadline := time.Now().Add(time.Second)
+	for {
+		calls, closed := connection.snapshot()
+		if closed {
+			if calls != 1 {
+				t.Fatalf("complete-after-message sent %d messages, want 1", calls)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("connection was not closed after its first message")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestMultipleWorkersPreservePerClientQueueOrder(t *testing.T) {
+	bus, err := New(WithWorkerCount(4), WithoutClientExpiration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	connection := &recordingConnection{}
+	if err := bus.Register("c", connection, SubscribeTo("orders")); err != nil {
+		t.Fatal(err)
+	}
+	const count = 500
+	for i := range count {
+		if err := bus.Publish(context.Background(), NewNamedEventWithData("orders", strconv.Itoa(i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for len(connection.snapshot()) < count && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	messages := connection.snapshot()
+	if len(messages) != count {
+		t.Fatalf("received %d messages, want %d", len(messages), count)
+	}
+	for i, message := range messages {
+		if want := strconv.Itoa(i); message.Data != want {
+			t.Fatalf("message %d data=%q, want %q", i, message.Data, want)
+		}
+	}
+}
+
+func TestClientLocksAreReleasedAndClosedReplayFails(t *testing.T) {
+	bus := newSyncBus(t, WithReplay(NewMemoryReplayStore(), time.Minute, time.Minute))
+	if err := bus.ReplayMissedEvents(context.Background(), "missing", ""); err != nil {
+		t.Fatal(err)
+	}
+	bus.clientLockMu.Lock()
+	locks := len(bus.clientLocks)
+	bus.clientLockMu.Unlock()
+	if locks != 0 {
+		t.Fatalf("client lock map retained %d unused entries", locks)
+	}
+	if err := bus.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.ReplayMissedEvents(context.Background(), "missing", ""); !errors.Is(err, ErrClosed) {
+		t.Fatalf("ReplayMissedEvents after Close error=%v", err)
+	}
+	if err := bus.Register("another", &recordingConnection{}); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Register after Close error=%v", err)
+	}
+	bus.clientLockMu.Lock()
+	locks = len(bus.clientLocks)
+	bus.clientLockMu.Unlock()
+	if locks != 0 {
+		t.Fatalf("failed operations retained %d client locks", locks)
 	}
 }

@@ -105,11 +105,11 @@ error.
 
 | Option | Description and default |
 | --- | --- |
-| `WithWorkerCount(count)` | Sets the number of asynchronous send workers. The default is `1`. More workers reduce head-of-line blocking but may relax global delivery ordering. |
+| `WithWorkerCount(count)` | Sets the number of asynchronous send workers. The default is `1`. First send attempts to one client generation are serialized in queue order; a failed event waiting for retry can be overtaken by later events. |
 | `WithSynchronousDelivery()` | Sends events in the publishing goroutine instead of using the send and retry queues. Send errors are returned directly and automatic retries are disabled. |
-| `WithQueueCapacities(send, retry)` | Sets the bounded send and retry queue capacities. Both default to `10,000`. A publisher waits when the send queue is full and can cancel that wait through its context. |
+| `WithQueueCapacities(send, retry)` | Sets the bounded send and retry queue capacities. Both default to `10,000`. A publisher waits when the send queue is full and can cancel that wait through its context. Retries are held in due-time order. |
 | `WithSendAttempts(attempts)` | Sets the maximum number of send attempts before a failing client is unregistered. The default is `40`. |
-| `WithSchedulerDelay(delay)` | Sets how often the retry queue is checked. The default is `500ms`. |
+| `WithSchedulerDelay(delay)` | Sets the maximum interval at which the due-time retry scheduler wakes while waiting. The default is `500ms`. |
 | `WithRetryBackoff(initial, maximum)` | Sets the initial exponential retry delay and its maximum. The defaults are `1s` and `30s`. |
 | `WithClientExpiration(expiration, scanInterval)` | Removes clients that have not had a successful send or heartbeat within `expiration`. Both values default to `24h`. |
 | `WithoutClientExpiration()` | Disables automatic removal of inactive clients. This is useful for fully application-managed client lifecycles and goroutine-free synchronous buses. |
@@ -142,7 +142,7 @@ Pass these options to `bus.Register` or `bus.RegisterContext`, or wrap them in
 | --- | --- |
 | `SubscribeTo(events...)` | Adds the client to the listed event subscriptions without removing its existing subscriptions. Calling `bus.Subscribe(clientID)` separately subscribes it to the default `message` event. |
 | `ReplaceSubscriptions(events...)` | Makes the supplied list authoritative: the client is removed from every subscription not in the list, then subscribed to every listed event. Passing no events unsubscribes it from everything. This is useful when a reconnect request contains the client's complete desired topic list. |
-| `CompleteAfterMessage()` | Closes the current connection after its first successful event. The logical client remains registered for reconnect and replay. |
+| `CompleteAfterMessage()` | Closes the current connection after exactly one successful application event. Concurrent workers are serialized at this boundary, and heartbeats do not count. The logical client remains registered for reconnect and replay. |
 | `ReplayFrom(lastEventID)` | After registration and subscription updates, replays retained subscribed events following `lastEventID`. A missing or unknown ID replays all retained events. It has no effect unless replay was enabled with `WithReplay`, and only published events with non-empty IDs can be replayed. |
 
 `SubscribeTo` and `ReplaceSubscriptions` both contribute events to the same
@@ -210,11 +210,20 @@ bus, err := sseeventbus.New(
 ```
 
 Only events with IDs are retained. A known last ID replays subsequent events;
-an empty or unknown ID replays all retained events. Explicit unregister and
+when an ID occurs more than once, replay resumes after its latest occurrence.
+An empty or unknown ID replays all retained events. Explicit unregister and
 client expiration clear retained history.
 
-The bus starts its workers in `New`. Always call `Close(ctx)` to stop maintenance
-jobs, flush the send queue, and close every registered connection. `Close`
+Delivery across a disconnect is at least once: an event whose send outcome was
+unknown when a connection was replaced can also appear in retained replay.
+Applications that require exactly-once processing should use unique event IDs
+and deduplicate them at the consumer. Replacing or unregistering a client
+invalidates queued work from its old connection generation, so stale retries
+cannot affect the replacement client.
+
+The bus starts its workers in `New`. Always call `Close(ctx)` to atomically stop
+new queue submissions, stop maintenance jobs, flush the send queue, discard
+scheduled retries, and close every registered connection. `Close`
 returns flush and connection-close errors and may be called more than once.
 Defaults are: one send worker, 10,000-item send and retry queues, 40 send
 attempts, one-day client expiration, disabled heartbeat, and disabled replay.

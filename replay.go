@@ -1,6 +1,7 @@
 package sseeventbus
 
 import (
+	"slices"
 	"sync"
 	"time"
 )
@@ -53,7 +54,8 @@ func (s *MemoryReplayStore) EventsSince(clientID, lastEventID string) []ReplayEv
 	start := 0
 	if lastEventID != "" {
 		found := false
-		for i, event := range events {
+		for i, event := range slices.Backward(events) {
+
 			if event.Event.ID == lastEventID {
 				start, found = i+1, true
 				break

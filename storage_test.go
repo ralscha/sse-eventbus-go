@@ -47,3 +47,15 @@ func TestMemoryReplayStorePurgesOutOfOrderEvents(t *testing.T) {
 		t.Fatalf("purged events=%#v", events)
 	}
 }
+
+func TestMemoryReplayStoreResumesAfterLatestDuplicateID(t *testing.T) {
+	var store MemoryReplayStore
+	now := time.Now()
+	for i, id := range []string{"same", "middle", "same", "after"} {
+		store.Store(ReplayEvent{ClientID: "client", Event: Event{Name: "x", ID: id}, StoredAt: now.Add(time.Duration(i) * time.Second)})
+	}
+	events := store.EventsSince("client", "same")
+	if len(events) != 1 || events[0].Event.ID != "after" {
+		t.Fatalf("EventsSince resumed after the wrong duplicate: %#v", events)
+	}
+}

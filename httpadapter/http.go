@@ -144,16 +144,17 @@ func (c *connection) openStream() error {
 // Serve registers a net/http SSE connection and blocks until the request ends,
 // the configured timeout expires, or complete-after-message closes it.
 func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientID string, options ...Option) error {
-	flush, ok := findFlusher(w)
-	if !ok {
-		http.Error(w, ErrStreamingUnsupported.Error(), http.StatusInternalServerError)
-		return ErrStreamingUnsupported
-	}
 	configuration := config{timeout: 3 * time.Minute}
 	for _, option := range options {
 		if option != nil {
 			option(&configuration)
 		}
+	}
+	if clientID == "" {
+		return sseeventbus.ErrInvalidClientID
+	}
+	if err := r.Context().Err(); err != nil {
+		return err
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	if w.Header().Get("Cache-Control") == "" {
@@ -162,14 +163,24 @@ func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientI
 	if w.Header().Get("X-Accel-Buffering") == "" {
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
-	conn := &connection{w: w, flush: flush, requestDone: r.Context().Done(), done: make(chan struct{})}
-	if err := bus.RegisterContext(r.Context(), clientID, conn, configuration.registration...); err != nil {
-		_ = conn.Close()
-		return err
+	controller := http.NewResponseController(w)
+	flush := func() error {
+		if err := controller.Flush(); err != nil {
+			if errors.Is(err, http.ErrNotSupported) {
+				return ErrStreamingUnsupported
+			}
+			return err
+		}
+		return nil
 	}
+	conn := &connection{w: w, flush: flush, requestDone: r.Context().Done(), done: make(chan struct{})}
 	if err := conn.openStream(); err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("open SSE stream: %w", err)
+	}
+	if err := bus.RegisterContext(r.Context(), clientID, conn, configuration.registration...); err != nil {
+		_ = conn.Close()
+		return err
 	}
 	var timeout <-chan time.Time
 	var timer *time.Timer
@@ -184,33 +195,4 @@ func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientI
 	case <-timeout:
 	}
 	return conn.Close()
-}
-
-type flushErrorer interface {
-	FlushError() error
-}
-
-type unwrapper interface {
-	Unwrap() http.ResponseWriter
-}
-
-func findFlusher(writer http.ResponseWriter) (func() error, bool) {
-	for writer != nil {
-		if flusher, ok := writer.(flushErrorer); ok {
-			return flusher.FlushError, true
-		}
-		if flusher, ok := writer.(http.Flusher); ok {
-			return func() error { flusher.Flush(); return nil }, true
-		}
-		wrapper, ok := writer.(unwrapper)
-		if !ok {
-			break
-		}
-		next := wrapper.Unwrap()
-		if next == writer {
-			break
-		}
-		writer = next
-	}
-	return nil, false
 }

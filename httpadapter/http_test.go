@@ -163,3 +163,35 @@ func TestServeSupportsWrappedWritersAndPreservesCachePolicy(t *testing.T) {
 		t.Fatalf("hop-by-hop Connection header was set: %q", recorder.Header().Get("Connection"))
 	}
 }
+
+type nonFlushingWriter struct {
+	header http.Header
+	body   strings.Builder
+	status int
+}
+
+func (w *nonFlushingWriter) Header() http.Header {
+	if w.header == nil {
+		w.header = make(http.Header)
+	}
+	return w.header
+}
+func (w *nonFlushingWriter) Write(value []byte) (int, error) { return w.body.Write(value) }
+func (w *nonFlushingWriter) WriteHeader(status int)          { w.status = status }
+
+func TestServeRejectsWriterWithoutStreamingSupportBeforeRegistration(t *testing.T) {
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	request := httptest.NewRequest(http.MethodGet, "/events", nil)
+	writer := &nonFlushingWriter{}
+	err = Serve(writer, request, bus, "c")
+	if !errors.Is(err, ErrStreamingUnsupported) {
+		t.Fatalf("Serve error=%v, want ErrStreamingUnsupported", err)
+	}
+	if bus.IsClientRegistered("c") {
+		t.Fatal("unsupported response writer registered a client")
+	}
+}

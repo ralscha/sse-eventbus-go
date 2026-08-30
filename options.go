@@ -7,7 +7,7 @@ import (
 )
 
 type config struct {
-	workers, sendCapacity, errorCapacity, attempts int
+	workers, sendCapacity, retryCapacity, attempts int
 	synchronous                                    bool
 	schedulerDelay, expiration, expirationScan     time.Duration
 	retryBase, retryMax                            time.Duration
@@ -25,7 +25,7 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		workers: 1, sendCapacity: 10_000, errorCapacity: 10_000, attempts: 40,
+		workers: 1, sendCapacity: 10_000, retryCapacity: 10_000, attempts: 40,
 		schedulerDelay: 500 * time.Millisecond, expiration: 24 * time.Hour,
 		retryBase: time.Second, retryMax: 30 * time.Second,
 		expirationScan: 24 * time.Hour, heartbeatComment: "heartbeat",
@@ -72,7 +72,7 @@ func WithQueueCapacities(send, retry int) Option {
 		if send < 1 || retry < 1 {
 			return errors.New("queue capacities must be positive")
 		}
-		c.sendCapacity, c.errorCapacity = send, retry
+		c.sendCapacity, c.retryCapacity = send, retry
 		return nil
 	}
 }
@@ -88,7 +88,8 @@ func WithSendAttempts(attempts int) Option {
 	}
 }
 
-// WithSchedulerDelay sets how often failed sends are checked for retry.
+// WithSchedulerDelay sets the maximum interval at which the due-time retry
+// scheduler wakes while waiting.
 func WithSchedulerDelay(delay time.Duration) Option {
 	return func(c *config) error {
 		if delay <= 0 {
