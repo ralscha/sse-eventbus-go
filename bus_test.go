@@ -733,7 +733,6 @@ type gatedCountingConnection struct {
 	closed  bool
 	started chan struct{}
 	release chan struct{}
-	once    sync.Once
 }
 
 func (c *gatedCountingConnection) Send(Message) error {
