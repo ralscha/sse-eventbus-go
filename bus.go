@@ -716,10 +716,7 @@ func (b *Bus) retryLoop() {
 		}
 		var timerC <-chan time.Time
 		if !next.IsZero() {
-			delay := max(time.Until(next), 0)
-			if delay > b.config.schedulerDelay {
-				delay = b.config.schedulerDelay
-			}
+			delay := min(max(time.Until(next), 0), b.config.schedulerDelay)
 			stopTimer(timer)
 			timer.Reset(delay)
 			timerC = timer.C
