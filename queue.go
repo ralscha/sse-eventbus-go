@@ -39,6 +39,9 @@ func (q *eventQueue) push(ctx context.Context, event *ClientEvent) error {
 		ctx = context.Background()
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		q.mu.Lock()
 		if q.closed {
 			q.mu.Unlock()
@@ -151,65 +154,46 @@ func (q *eventQueue) compactLocked() {
 		return
 	}
 	if q.head >= 1024 && q.head*2 >= len(q.items) {
-		copy(q.items, q.items[q.head:])
-		q.items = q.items[:len(q.items)-q.head]
+		remaining := copy(q.items, q.items[q.head:])
+		clear(q.items[remaining:])
+		q.items = q.items[:remaining]
 		q.head = 0
 	}
 }
 
-// retryQueue is a bounded priority queue. A single scheduler removes due
-// events; failed-send workers only add events, so the scheduler never blocks
-// trying to reinsert an item into its own queue.
+// retryQueue is a bounded priority queue. When full, schedule hands the earliest
+// retry back to the worker. Workers must never wait for retry queue capacity:
+// the scheduler may itself be waiting for space in the send queue.
 type retryQueue struct {
-	mu         sync.Mutex
-	items      retryHeap
-	capacity   int
-	sequence   uint64
-	changed    chan struct{}
-	spaceReady chan struct{}
-	closed     bool
-	closedCh   chan struct{}
+	mu       sync.Mutex
+	items    retryHeap
+	capacity int
+	sequence uint64
+	changed  chan struct{}
+	closed   bool
 }
 
 func newRetryQueue(capacity int) *retryQueue {
 	return &retryQueue{
-		capacity:   capacity,
-		changed:    make(chan struct{}, 1),
-		spaceReady: make(chan struct{}, 1),
-		closedCh:   make(chan struct{}),
+		capacity: capacity,
+		changed:  make(chan struct{}, 1),
 	}
 }
 
-func (q *retryQueue) push(ctx context.Context, event *ClientEvent) error {
-	if ctx == nil {
-		ctx = context.Background()
+func (q *retryQueue) schedule(event *ClientEvent) (*ClientEvent, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return nil, ErrClosed
 	}
-	for {
-		q.mu.Lock()
-		if q.closed {
-			q.mu.Unlock()
-			return ErrClosed
-		}
-		if len(q.items) < q.capacity {
-			q.sequence++
-			event.retryOrder = q.sequence
-			heap.Push(&q.items, event)
-			signal(q.changed)
-			if len(q.items) < q.capacity {
-				signal(q.spaceReady)
-			}
-			q.mu.Unlock()
-			return nil
-		}
-		q.mu.Unlock()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-q.closedCh:
-			return ErrClosed
-		case <-q.spaceReady:
-		}
+	q.sequence++
+	event.retryOrder = q.sequence
+	heap.Push(&q.items, event)
+	signal(q.changed)
+	if len(q.items) > q.capacity {
+		return heap.Pop(&q.items).(*ClientEvent), nil
 	}
+	return nil, nil
 }
 
 // popDue returns one due event, the next due time when no event is ready, and
@@ -228,7 +212,6 @@ func (q *retryQueue) popDue(now time.Time) (*ClientEvent, time.Time, bool) {
 		return nil, next.retryAfter, true
 	}
 	event := heap.Pop(&q.items).(*ClientEvent)
-	signal(q.spaceReady)
 	return event, time.Time{}, true
 }
 
@@ -247,15 +230,11 @@ func (q *retryQueue) remove(match func(*ClientEvent) bool) {
 	q.items = kept
 	heap.Init(&q.items)
 	signal(q.changed)
-	signal(q.spaceReady)
 }
 
 func (q *retryQueue) close() {
 	q.mu.Lock()
-	if !q.closed {
-		q.closed = true
-		close(q.closedCh)
-	}
+	q.closed = true
 	q.mu.Unlock()
 }
 

@@ -53,16 +53,11 @@ func (s *MemoryReplayStore) EventsSince(clientID, lastEventID string) []ReplayEv
 	}
 	start := 0
 	if lastEventID != "" {
-		found := false
 		for i, event := range slices.Backward(events) {
-
 			if event.Event.ID == lastEventID {
-				start, found = i+1, true
+				start = i + 1
 				break
 			}
-		}
-		if !found {
-			start = 0
 		}
 	}
 	result := append([]ReplayEvent(nil), events[start:]...)

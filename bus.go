@@ -89,7 +89,7 @@ type deliveryNotification struct {
 }
 
 type clientLock struct {
-	mu         sync.Mutex
+	gate       chan struct{}
 	references int
 }
 
@@ -168,7 +168,7 @@ func (b *Bus) Register(clientID string, connection Connection, options ...Regist
 }
 
 // RegisterContext registers or atomically reconnects a client. The context
-// controls waiting for queue capacity while replaying retained events.
+// controls waiting for the client's lifecycle lock and replay queue capacity.
 func (b *Bus) RegisterContext(ctx context.Context, clientID string, connection Connection, options ...RegistrationOption) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -188,7 +188,10 @@ func (b *Bus) RegisterContext(ctx context.Context, clientID string, connection C
 			option(&registration)
 		}
 	}
-	unlock := b.lockClient(clientID)
+	unlock, err := b.lockClientContext(ctx, clientID)
+	if err != nil {
+		return err
+	}
 	b.mu.Lock()
 	if b.closed {
 		b.mu.Unlock()
@@ -242,10 +245,10 @@ func sameConnection(left, right Connection) bool {
 	if leftType != rightType {
 		return false
 	}
-	if leftType.Comparable() {
+	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
+	if leftValue.Comparable() && rightValue.Comparable() {
 		return left == right
 	}
-	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
 	switch leftType.Kind() {
 	case reflect.Map:
 		return leftValue.Pointer() == rightValue.Pointer()
@@ -260,6 +263,32 @@ func sameConnection(left, right Connection) bool {
 // history.
 func (b *Bus) Unregister(clientID string) bool {
 	return b.unregister(clientID, nil, nil, true)
+}
+
+// Disconnect closes the matching connection and discards its pending sends,
+// while retaining the logical client, subscriptions, and replay history.
+// A stale connection cannot disconnect a replacement registered under the same ID.
+func (b *Bus) Disconnect(clientID string, connection Connection) bool {
+	if isNil(connection) {
+		return false
+	}
+	b.mu.RLock()
+	target := b.clients[clientID]
+	b.mu.RUnlock()
+	if target == nil || !sameConnection(target.connection, connection) {
+		return false
+	}
+	unlock := b.lockClient(clientID)
+	defer unlock()
+	b.mu.RLock()
+	current := b.clients[clientID] == target
+	b.mu.RUnlock()
+	if !current {
+		return false
+	}
+	_ = target.retire(true)
+	b.removePending(target, false)
+	return true
 }
 
 func (b *Bus) unregister(clientID string, expected *client, staleBefore *time.Time, observeNoop bool) bool {
@@ -303,23 +332,38 @@ func (b *Bus) unregister(clientID string, expected *client, staleBefore *time.Ti
 }
 
 func (b *Bus) lockClient(clientID string) func() {
+	unlock, _ := b.lockClientContext(context.Background(), clientID)
+	return unlock
+}
+
+func (b *Bus) lockClientContext(ctx context.Context, clientID string) (func(), error) {
 	b.clientLockMu.Lock()
 	lock := b.clientLocks[clientID]
 	if lock == nil {
-		lock = &clientLock{}
+		lock = &clientLock{gate: make(chan struct{}, 1)}
 		b.clientLocks[clientID] = lock
 	}
 	lock.references++
 	b.clientLockMu.Unlock()
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
+	releaseReference := func() {
 		b.clientLockMu.Lock()
 		lock.references--
 		if lock.references == 0 && b.clientLocks[clientID] == lock {
 			delete(b.clientLocks, clientID)
 		}
 		b.clientLockMu.Unlock()
+	}
+	select {
+	case lock.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-lock.gate
+			releaseReference()
+			return nil, err
+		}
+		return func() { <-lock.gate; releaseReference() }, nil
+	case <-ctx.Done():
+		releaseReference()
+		return nil, ctx.Err()
 	}
 }
 
@@ -339,6 +383,10 @@ func (b *Bus) SubscribeOnly(clientID, event string) {
 }
 func (b *Bus) Unsubscribe(clientID, event string) { b.config.registry.Unsubscribe(clientID, event) }
 func (b *Bus) UnsubscribeFromAll(clientID string, keepEvents ...string) {
+	if len(keepEvents) == 0 {
+		b.config.registry.UnsubscribeAll(clientID)
+		return
+	}
 	keep := make(map[string]struct{}, len(keepEvents))
 	for _, event := range keepEvents {
 		keep[event] = struct{}{}
@@ -360,8 +408,13 @@ func (b *Bus) Publish(ctx context.Context, event Event) error {
 	}
 	event = normalizeEvent(event)
 	localErr := b.handle(ctx, event, OperationHandleEvent)
-	if errors.Is(localErr, ErrInvalidEvent) || errors.Is(localErr, ErrClosed) {
+	if errors.Is(localErr, ErrInvalidEvent) {
 		return localErr
+	}
+	select {
+	case <-b.stop:
+		return errors.Join(localErr, ErrClosed)
+	default:
 	}
 	var remoteErr error
 	if b.config.distributed != nil {
@@ -424,7 +477,10 @@ func (b *Bus) handle(ctx context.Context, event Event, operation Operation) erro
 			}
 			conversionDone = true
 		}
-		unlock := b.lockClient(id)
+		unlock, err := b.lockClientContext(ctx, id)
+		if err != nil {
+			return err
+		}
 		if !b.config.registry.IsSubscribed(id, event.Name) {
 			unlock()
 			continue
@@ -452,7 +508,6 @@ func (b *Bus) handle(ctx context.Context, event Event, operation Operation) erro
 			continue
 		}
 		var sent bool
-		var err error
 		if b.config.synchronous {
 			unlock()
 			sent, err = b.deliver(ctx, clientEvent)
@@ -523,28 +578,23 @@ func (b *Bus) send(event *ClientEvent) (bool, error) {
 	}
 	connection := client.connection
 	complete := client.completeAfterMessage
-	attempt := int(event.attempts.Add(1))
+	event.attempts.Add(1)
 	err := connection.Send(event.Message)
 	var closeConnection Connection
 	if err == nil {
 		client.lastTransfer = time.Now()
-		if complete {
-			client.inactive.Store(true)
-			if !client.connectionClosed {
-				client.connectionClosed = true
-				closeConnection = connection
-			}
+	}
+	if (err == nil && complete) || errors.Is(err, ErrClosed) {
+		client.inactive.Store(true)
+		if !client.connectionClosed {
+			client.connectionClosed = true
+			closeConnection = connection
 		}
 	}
 	client.mu.Unlock()
 	if closeConnection != nil {
 		_ = closeConnection.Close()
 	}
-	observation := Observation{Operation: OperationSendEvent, Outcome: "success", ClientID: event.ClientID, EventName: event.Event.Name, Replay: event.Event.ID != "", CompleteAfterMessage: complete, Attempt: attempt, Err: err}
-	if err != nil {
-		observation.Outcome = "error"
-	}
-	b.observe(context.Background(), observation)
 	return true, err
 }
 
@@ -642,56 +692,105 @@ func (b *Bus) isCurrentEvent(event *ClientEvent) bool {
 
 func (b *Bus) worker() {
 	defer b.wg.Done()
+	var pending *ClientEvent
 	for {
-		event, ok := b.sendQueue.pop()
-		if !ok {
-			return
+		event := pending
+		pending = nil
+		var retry bool
+		if event != nil {
+			// A full retry queue transfers one retry to this worker. Waiting for
+			// its due time uses no queue slot or per-client ordering lock.
+			if !b.waitForRetry(event) {
+				continue
+			}
+			b.notifyQueued(event, false)
+			retry = b.attempt(event)
+		} else {
+			var ok bool
+			event, ok = b.sendQueue.pop()
+			if !ok {
+				return
+			}
+			order := event.sendOrder
+			if !event.client.waitForTurn(order) {
+				continue
+			}
+			retry = b.attempt(event)
+			event.client.finishTurn(order)
 		}
-		if !event.client.waitForTurn(event.sendOrder) {
+		if !retry {
 			continue
 		}
-		stopWorker := func() bool {
-			defer event.client.finishTurn(event.sendOrder)
-			if !b.isCurrentEvent(event) {
-				return false
+		delay := b.config.retryBase
+		for range min(event.Attempts()-1, 63) {
+			if delay > b.config.retryMax/2 {
+				delay = b.config.retryMax
+				break
 			}
-			if event.Attempts() >= b.config.attempts {
-				if b.unregister(event.ClientID, event.client, nil, false) {
-					b.notifyUnregistered([]string{event.ClientID})
-				}
-				return false
-			}
-			attempted, err := b.send(event)
-			if !attempted && errors.Is(err, errInactiveClient) {
-				return false
-			}
-			b.notifySent(event, err)
-			if err != nil {
-				if !b.isCurrentEvent(event) {
-					return false
-				}
-				delay := b.config.retryBase
-				for range min(event.Attempts()-1, 62) {
-					if delay >= b.config.retryMax/2 {
-						delay = b.config.retryMax
-						break
-					}
-					delay *= 2
-				}
-				if delay > b.config.retryMax {
-					delay = b.config.retryMax
-				}
-				event.retryAfter = time.Now().Add(delay)
-				if pushErr := b.retryQueue.push(context.Background(), event); pushErr != nil {
-					return true
-				}
-			}
-			return false
-		}()
-		if stopWorker {
+			delay *= 2
+		}
+		event.retryAfter = time.Now().Add(min(delay, b.config.retryMax))
+		var err error
+		pending, err = b.retryQueue.schedule(event)
+		if err != nil {
 			return
 		}
 	}
+}
+
+func (b *Bus) waitForRetry(event *ClientEvent) bool {
+	for b.isCurrentEvent(event) && event.client.isActive() {
+		select {
+		case <-b.stop:
+			return false
+		default:
+		}
+		delay := time.Until(event.retryAfter)
+		if delay <= 0 {
+			return true
+		}
+		timer := time.NewTimer(min(delay, b.config.schedulerDelay))
+		select {
+		case <-b.stop:
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+	}
+	return false
+}
+
+// attempt returns whether a failed send needs another retry.
+func (b *Bus) attempt(event *ClientEvent) bool {
+	if !b.isCurrentEvent(event) || !event.client.isActive() {
+		return false
+	}
+	if event.Attempts() < b.config.attempts {
+		attempted, err := b.send(event)
+		if !attempted {
+			return false
+		}
+		b.notifySent(event, err)
+		if err == nil || !b.isCurrentEvent(event) || !event.client.isActive() {
+			return false
+		}
+		if event.Attempts() < b.config.attempts {
+			return true
+		}
+	}
+	if event.client.inactive.CompareAndSwap(false, true) {
+		// A publisher may hold this client's lifecycle lock while waiting for
+		// send queue capacity. Let the worker keep draining that queue while
+		// removal waits for the lock. At most one removal runs per generation.
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			if b.unregister(event.ClientID, event.client, nil, false) {
+				b.notifyUnregistered([]string{event.ClientID})
+			}
+		}()
+	}
+	return false
 }
 
 func (b *Bus) retryLoop() {
@@ -827,7 +926,10 @@ func (b *Bus) ReplayMissedEvents(ctx context.Context, clientID, lastEventID stri
 		b.observe(ctx, observation)
 		return nil
 	}
-	unlock := b.lockClient(clientID)
+	unlock, err := b.lockClientContext(ctx, clientID)
+	if err != nil {
+		return err
+	}
 	observation, notifications, err := b.replayMissedEventsLocked(ctx, clientID, lastEventID)
 	unlock()
 	b.notifyDeliveries(notifications)
@@ -864,7 +966,14 @@ func (b *Bus) replayMissedEventsLocked(ctx context.Context, clientID, lastEventI
 	b.removePending(target, true)
 	var replayErrors []error
 	var notifications []deliveryNotification
+	cutoff := time.Now().Add(-b.config.replayRetention)
 	for _, retained := range b.config.replayStore.EventsSince(clientID, lastEventID) {
+		if !target.isActive() {
+			break
+		}
+		if retained.StoredAt.Before(cutoff) {
+			continue
+		}
 		retained.Event = normalizeEvent(retained.Event)
 		if !b.config.registry.IsSubscribed(clientID, retained.Event.Name) {
 			continue
@@ -877,6 +986,9 @@ func (b *Bus) replayMissedEventsLocked(ctx context.Context, clientID, lastEventI
 		message := Message{Event: retained.Event.Name, Data: retained.ConvertedValue, HasData: retained.HasConverted, Retry: retained.Event.Retry, ID: retained.Event.ID, Comment: retained.Event.Comment}
 		clientEvent := &ClientEvent{ClientID: clientID, Event: retained.Event, Message: message, client: target, generation: generation}
 		sent, err := b.deliver(ctx, clientEvent)
+		if errors.Is(err, errInactiveClient) {
+			break
+		}
 		if err == nil || sent {
 			notifications = append(notifications, deliveryNotification{event: clientEvent, sent: sent, err: err})
 		}
@@ -923,6 +1035,11 @@ func (b *Bus) notifyQueued(event *ClientEvent, first bool) {
 	b.config.listener.AfterEventQueued(event.listenerSnapshot(), first)
 }
 func (b *Bus) notifySent(event *ClientEvent, err error) {
+	observation := Observation{Operation: OperationSendEvent, Outcome: "success", ClientID: event.ClientID, EventName: event.Event.Name, Replay: event.Event.ID != "", CompleteAfterMessage: event.client.completeAfterMessage, Attempt: event.Attempts(), Err: err}
+	if err != nil {
+		observation.Outcome = "error"
+	}
+	b.observe(context.Background(), observation)
 	defer b.recoverExtensionPanic()
 	b.config.listener.AfterEventSent(event.listenerSnapshot(), err)
 }

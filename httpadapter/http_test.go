@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,13 +132,32 @@ func TestConnectionNormalizesAllSSELineEndings(t *testing.T) {
 func TestConnectionRejectsLineInjection(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	conn := &connection{w: recorder, flush: func() error { return nil }, requestDone: make(chan struct{}), done: make(chan struct{})}
-	for _, message := range []sseeventbus.Message{{Event: "orders\ndata:injected"}, {ID: "id\rretry:0"}, {ID: "id\x00ignored"}} {
+	for _, message := range []sseeventbus.Message{{Event: "orders\ndata:injected"}, {ID: "id\rretry:0"}, {ID: "id\x00ignored"}, {Retry: -time.Second}} {
 		if err := conn.Send(message); !errors.Is(err, ErrInvalidMessage) {
 			t.Fatalf("Send(%#v) error=%v", message, err)
 		}
 	}
 	if recorder.Body.Len() != 0 {
 		t.Fatalf("invalid message wrote %q", recorder.Body.String())
+	}
+}
+
+func TestConnectionPreservesLeadingSpaces(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	conn := &connection{w: recorder, flush: func() error { return nil }, done: make(chan struct{})}
+	if err := conn.Send(sseeventbus.Message{Event: " orders", ID: " id", Data: " first\n  second", HasData: true}); err != nil {
+		t.Fatal(err)
+	}
+	// EventSource removes exactly one space after each field's colon.
+	fields := map[string]string{}
+	for line := range strings.SplitSeq(recorder.Body.String(), "\n") {
+		name, value, ok := strings.Cut(line, ":")
+		if ok {
+			fields[name] += strings.TrimPrefix(value, " ") + "\n"
+		}
+	}
+	if fields["event"] != " orders\n" || fields["id"] != " id\n" || fields["data"] != " first\n  second\n" {
+		t.Fatalf("decoded fields = %#v", fields)
 	}
 }
 
@@ -193,5 +214,213 @@ func TestServeRejectsWriterWithoutStreamingSupportBeforeRegistration(t *testing.
 	}
 	if bus.IsClientRegistered("c") {
 		t.Fatal("unsupported response writer registered a client")
+	}
+}
+
+func TestServeAutomaticallyReplaysLastEventID(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		options []Option
+		wantID  string
+	}{
+		{name: "header", wantID: "2"},
+		{name: "explicit cursor", options: []Option{WithLastEventID("2")}, wantID: "3"},
+		{name: "explicit empty cursor", options: []Option{WithLastEventID("")}, wantID: "1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := sseeventbus.NewMemoryReplayStore()
+			for _, id := range []string{"1", "2", "3"} {
+				store.Store(sseeventbus.ReplayEvent{ClientID: "c", Event: sseeventbus.Event{ID: id}, ConvertedValue: id, HasConverted: true, StoredAt: time.Now()})
+			}
+			bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery(), sseeventbus.WithReplay(store, time.Minute, time.Minute))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = bus.Close(context.Background()) })
+			r := httptest.NewRequest(http.MethodGet, "/events", nil)
+			r.Header.Set("Last-Event-ID", "1")
+			w := httptest.NewRecorder()
+			options := append([]Option{WithRegistration(sseeventbus.SubscribeTo(sseeventbus.DefaultEvent), sseeventbus.CompleteAfterMessage())}, tc.options...)
+			if err := Serve(w, r, bus, "c", options...); err != nil {
+				t.Fatal(err)
+			}
+			if want := ":\n\nid:" + tc.wantID + "\ndata:" + tc.wantID + "\n\n"; w.Body.String() != want {
+				t.Fatalf("body = %q, want %q", w.Body.String(), want)
+			}
+		})
+	}
+}
+
+type gatedConnection struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gatedConnection) Send(sseeventbus.Message) error {
+	c.once.Do(func() { close(c.started) })
+	<-c.release
+	return nil
+}
+func (*gatedConnection) Close() error { return nil }
+
+func TestServeTimeoutCancelsReplayBackpressure(t *testing.T) {
+	store := sseeventbus.NewMemoryReplayStore()
+	store.Store(sseeventbus.ReplayEvent{ClientID: "c", Event: sseeventbus.Event{ID: "1"}, StoredAt: time.Now()})
+	bus, err := sseeventbus.New(sseeventbus.WithQueueCapacities(1, 1), sseeventbus.WithReplay(store, time.Minute, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker := &gatedConnection{started: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(func() { close(blocker.release); _ = bus.Close(context.Background()) })
+	if err := bus.Register("blocker", blocker, sseeventbus.SubscribeTo(sseeventbus.DefaultEvent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(context.Background(), sseeventbus.NewEvent("first")); err != nil {
+		t.Fatal(err)
+	}
+	<-blocker.started
+	if err := bus.Publish(context.Background(), sseeventbus.NewEvent("second")); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/events", nil), bus, "c",
+			WithTimeout(10*time.Millisecond), WithLastEventID(""), WithRegistration(sseeventbus.SubscribeTo(sseeventbus.DefaultEvent)))
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve timeout did not cancel replay")
+	}
+	if !bus.IsClientRegistered("c") || len(store.EventsSince("c", "")) != 1 {
+		t.Fatal("timed out replay lost logical client state")
+	}
+}
+
+func TestServeDisconnectRetainsOfflineEvents(t *testing.T) {
+	store := sseeventbus.NewMemoryReplayStore()
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery(), sseeventbus.WithReplay(store, time.Minute, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	if err := Serve(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/events", nil), bus, "c",
+		WithTimeout(time.Millisecond), WithRegistration(sseeventbus.SubscribeTo(sseeventbus.DefaultEvent))); err != nil {
+		t.Fatal(err)
+	}
+	if err := bus.Publish(context.Background(), sseeventbus.Event{ID: "offline", Data: "saved"}); err != nil {
+		t.Fatalf("offline publish tried to send on the ended HTTP response: %v", err)
+	}
+	if !bus.IsClientRegistered("c") || len(store.EventsSince("c", "")) != 1 {
+		t.Fatal("disconnected client lost its retained event")
+	}
+}
+
+type pipeWriter struct {
+	net.Conn
+	header http.Header
+}
+
+func (w *pipeWriter) Header() http.Header { return w.header }
+func (*pipeWriter) WriteHeader(int)       {}
+func (*pipeWriter) FlushError() error     { return nil }
+
+func TestServeWriteTimeoutBoundsBlockedStream(t *testing.T) {
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close(); _ = client.Close() })
+	w := &pipeWriter{Conn: server, header: make(http.Header)}
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(w, httptest.NewRequest(http.MethodGet, "/events", nil), bus, "c", WithWriteTimeout(10*time.Millisecond))
+	}()
+	select {
+	case err := <-done:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write timeout did not release blocked stream")
+	}
+	if bus.IsClientRegistered("c") {
+		t.Fatal("failed stream was registered")
+	}
+}
+
+func TestServeRejectsUnsupportedWriteDeadlines(t *testing.T) {
+	bus, err := sseeventbus.New(sseeventbus.WithSynchronousDelivery())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	w := httptest.NewRecorder()
+	err = Serve(w, httptest.NewRequest(http.MethodGet, "/events", nil), bus, "c", WithWriteTimeout(time.Second))
+	if !errors.Is(err, http.ErrNotSupported) || w.Body.Len() != 0 || bus.IsClientRegistered("c") {
+		t.Fatalf("unsupported deadlines: err = %v, body = %q", err, w.Body.String())
+	}
+}
+
+type failingFlushWriter struct {
+	*httptest.ResponseRecorder
+	calls int
+	err   error
+}
+
+func (w *failingFlushWriter) FlushError() error {
+	w.calls++
+	if w.calls > 1 {
+		return w.err
+	}
+	return nil
+}
+
+func TestServeReturnsWriteFailureAndPreservesHistory(t *testing.T) {
+	store := sseeventbus.NewMemoryReplayStore()
+	bus, err := sseeventbus.New(sseeventbus.WithSendAttempts(1), sseeventbus.WithReplay(store, time.Minute, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bus.Close(context.Background()) })
+	failed := errors.New("flush failed")
+	w := &failingFlushWriter{ResponseRecorder: httptest.NewRecorder(), err: failed}
+	done := make(chan error, 1)
+	go func() {
+		done <- Serve(w, httptest.NewRequest(http.MethodGet, "/events", nil), bus, "c", WithRegistration(sseeventbus.SubscribeTo(sseeventbus.DefaultEvent)))
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !bus.IsClientRegistered("c") {
+		if time.Now().After(deadline) {
+			t.Fatal("client did not register")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := bus.Publish(context.Background(), sseeventbus.Event{ID: "1", Data: "saved"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, failed) {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write failure did not terminate Serve")
+	}
+	if !bus.IsClientRegistered("c") || len(store.EventsSince("c", "")) != 1 {
+		t.Fatal("failed stream lost logical client state")
+	}
+	if err := bus.Publish(context.Background(), sseeventbus.Event{ID: "2", Data: "offline"}); err != nil {
+		t.Fatal(err)
+	}
+	if w.calls != 2 {
+		t.Fatalf("failed stream was written again: %d flushes", w.calls)
 	}
 }

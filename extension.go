@@ -6,7 +6,9 @@ import (
 )
 
 // Connection is implemented by an SSE transport. Implementations must be safe
-// for use by the configured number of send workers.
+// for use by the configured number of send workers. Send may return ErrClosed
+// (or wrap it) to retire a disconnected connection without deleting its logical
+// client or replay history. Other send errors are eligible for automatic retry.
 type Connection interface {
 	Send(Message) error
 	Close() error

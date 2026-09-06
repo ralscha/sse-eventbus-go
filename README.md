@@ -72,7 +72,6 @@ func main() {
 		err := httpadapter.Serve(w, r, bus, clientID,
 			httpadapter.WithRegistration(
 				sseeventbus.ReplaceSubscriptions("orders", "news"),
-				sseeventbus.ReplayFrom(r.Header.Get("Last-Event-ID")),
 			),
 		)
 		if err != nil && !errors.Is(err, sseeventbus.ErrClosed) &&
@@ -88,9 +87,10 @@ func main() {
 
 `Serve` uses a three-minute default connection timeout. Use
 `httpadapter.WithTimeout(0)` to rely only on the request context, or provide a
-different duration. A disconnected request leaves the logical client registered
-for reconnection and replay. Call `bus.Unregister(clientID)` when that state
-should be permanently removed.
+different duration. The timeout also cancels registration and replay queue waits.
+A disconnected request leaves the logical client registered for reconnection and
+replay, without retrying sends on the ended HTTP response. Call
+`bus.Unregister(clientID)` when that state should be permanently removed.
 
 ## Configuration options
 
@@ -121,6 +121,12 @@ error.
 | `WithObserver(observer)` | Receives structured completed-operation observations. No observer is installed by default. |
 | `WithPanicHandler(handler)` | Reports panics recovered from listener and observer callbacks. By default these panics are isolated silently so they cannot terminate delivery workers. |
 | `WithDistributedTransport(transport)` | Enables cross-node event publication. The transport must prevent events from being echoed to their originating node. |
+
+When the retry queue fills, each send worker can hold one pending retry and wait
+for its due time. This keeps memory bounded and allows delivery to make progress
+even when both queues are full. `RetryQueueSize` counts queued retries; it excludes
+work already held by a worker or the scheduler. A client that exhausts its send
+attempts is retired immediately and removed asynchronously.
 
 For example:
 
@@ -154,12 +160,14 @@ For reconnectable HTTP clients, a typical registration is:
 ```go
 httpadapter.WithRegistration(
 	sseeventbus.ReplaceSubscriptions("orders", "news"),
-	sseeventbus.ReplayFrom(r.Header.Get("Last-Event-ID")),
 )
 ```
 
 The subscriptions are updated before replay starts, so retained events are
-replayed only for the topics the client currently subscribes to.
+replayed only for the topics the client currently subscribes to. With replay
+enabled on the bus, `Serve` automatically uses a non-empty `Last-Event-ID` request
+header. An explicit `ReplayFrom` or `WithLastEventID` overrides the header; an
+explicit empty cursor requests all retained history, including on a first request.
 
 ### HTTP adapter options
 
@@ -168,8 +176,16 @@ Pass these options directly to `httpadapter.Serve`.
 | Option | Description and default |
 | --- | --- |
 | `WithTimeout(timeout)` | Sets the lifetime of this HTTP streaming request. The default is `3m`; a non-positive duration disables the adapter timeout and relies on request cancellation. |
+| `WithWriteTimeout(timeout)` | Bounds each response write and flush, including the initial comment. Disabled by default. A positive duration requires a response writer supporting write deadlines; unsupported writers return `http.ErrNotSupported`. |
 | `WithRegistration(options...)` | Passes one or more client registration options through to `bus.Register`. |
 | `WithLastEventID(lastEventID)` | Shorthand for `WithRegistration(sseeventbus.ReplayFrom(lastEventID))`. |
+
+For example, `httpadapter.WithWriteTimeout(10*time.Second)` prevents a client
+that stops reading from indefinitely blocking a send. The adapter clears this
+deadline after each write so idle streams remain usable. Without this option,
+the HTTP server controls write deadlines. Write or flush failures terminate the
+response and are returned from `Serve`; retained events remain available for
+reconnection.
 
 ## Publishing
 
@@ -211,8 +227,16 @@ bus, err := sseeventbus.New(
 
 Only events with IDs are retained. A known last ID replays subsequent events;
 when an ID occurs more than once, replay resumes after its latest occurrence.
-An empty or unknown ID replays all retained events. Explicit unregister and
-client expiration clear retained history.
+An empty or unknown ID replays all retained events. Events older than the
+configured retention are excluded even if the cleanup job has not run yet.
+Explicit unregister and client expiration clear retained history.
+
+Custom adapters can call `bus.Disconnect(clientID, connection)` when a transport
+ends. This closes that connection and discards pending sends while preserving
+subscriptions and retained events, including new events published while offline.
+The connection argument prevents cleanup from an old request from disconnecting
+a replacement. Use a distinct connection object for each request. The HTTP
+adapter performs this cleanup automatically.
 
 Delivery across a disconnect is at least once: an event whose send outcome was
 unknown when a connection was replaced can also appear in retained replay.
@@ -241,10 +265,14 @@ type Connection interface {
 }
 ```
 
-Register it with `bus.Register`, or use `bus.RegisterContext` when replay queue
-backpressure should be cancelable. `Message` already contains converted data
+Register it with `bus.Register`, or use `bus.RegisterContext` when registration
+lock waits and replay queue backpressure should be cancelable. `Message` already contains converted data
 and the SSE event, ID, retry, and comment fields. Connection methods must be
 concurrent-safe, and `Close` should be idempotent.
+Return or wrap `sseeventbus.ErrClosed` from `Send` when the connection is permanently
+closed. The bus then retires that connection and retains its logical client state;
+other send errors use the configured retry policy. A local connection error does
+not prevent delivery to the distributed transport.
 
 The following dependency-free extension points exist in the core package:
 

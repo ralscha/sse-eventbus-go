@@ -2,6 +2,7 @@
 package httpadapter
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ var ErrInvalidMessage = errors.New("invalid SSE message")
 
 type config struct {
 	timeout      time.Duration
+	writeTimeout time.Duration
 	registration []sseeventbus.RegistrationOption
 }
 
@@ -29,6 +31,12 @@ type Option func(*config)
 
 // WithTimeout controls how long the handler stays open. A non-positive value disables the adapter timeout.
 func WithTimeout(timeout time.Duration) Option { return func(c *config) { c.timeout = timeout } }
+
+// WithWriteTimeout bounds each write and flush. A non-positive value leaves
+// write deadlines to the HTTP server. The ResponseWriter must support deadlines.
+func WithWriteTimeout(timeout time.Duration) Option {
+	return func(c *config) { c.writeTimeout = timeout }
+}
 
 // WithRegistration passes options to Bus.Register.
 func WithRegistration(options ...sseeventbus.RegistrationOption) Option {
@@ -41,13 +49,15 @@ func WithLastEventID(lastEventID string) Option {
 }
 
 type connection struct {
-	mu          sync.Mutex
-	w           http.ResponseWriter
-	flush       func() error
-	requestDone <-chan struct{}
-	done        chan struct{}
-	closeOnce   sync.Once
-	closed      bool
+	mu               sync.Mutex
+	w                http.ResponseWriter
+	flush            func() error
+	setWriteDeadline func(time.Time) error
+	writeTimeout     time.Duration
+	requestDone      <-chan struct{}
+	done             chan struct{}
+	closed           bool
+	err              error
 }
 
 func (c *connection) Send(message sseeventbus.Message) error {
@@ -67,6 +77,9 @@ func (c *connection) Send(message sseeventbus.Message) error {
 	if strings.ContainsAny(message.ID, "\x00\r\n") {
 		return fmt.Errorf("%w: ID contains a null or line break", ErrInvalidMessage)
 	}
+	if message.Retry < 0 {
+		return fmt.Errorf("%w: retry duration is negative", ErrInvalidMessage)
+	}
 	var builder strings.Builder
 	if message.Comment != "" {
 		for _, line := range splitLines(message.Comment) {
@@ -76,14 +89,10 @@ func (c *connection) Send(message sseeventbus.Message) error {
 		}
 	}
 	if message.Event != "" && message.Event != sseeventbus.DefaultEvent {
-		builder.WriteString("event:")
-		builder.WriteString(message.Event)
-		builder.WriteByte('\n')
+		writeField(&builder, "event", message.Event)
 	}
 	if message.ID != "" {
-		builder.WriteString("id:")
-		builder.WriteString(message.ID)
-		builder.WriteByte('\n')
+		writeField(&builder, "id", message.ID)
 	}
 	if message.Retry > 0 {
 		builder.WriteString("retry:")
@@ -92,20 +101,49 @@ func (c *connection) Send(message sseeventbus.Message) error {
 	}
 	if message.HasData {
 		for _, line := range splitLines(message.Data) {
-			builder.WriteString("data:")
-			builder.WriteString(line)
-			builder.WriteByte('\n')
+			writeField(&builder, "data", line)
 		}
 	}
 	builder.WriteByte('\n')
-	written, err := io.WriteString(c.w, builder.String())
+	if err := c.writeFrame(builder.String()); err != nil {
+		return errors.Join(sseeventbus.ErrClosed, err)
+	}
+	return nil
+}
+
+// writeFrame requires c.mu. Transport failures terminate the stream: retrying a
+// partially written SSE frame on the same response could corrupt the next event.
+func (c *connection) writeFrame(frame string) (err error) {
+	defer func() {
+		if err != nil {
+			c.closeLocked(err)
+		}
+	}()
+	if c.writeTimeout > 0 {
+		if err := c.setWriteDeadline(time.Now().Add(c.writeTimeout)); err != nil {
+			return err
+		}
+		defer func() { _ = c.setWriteDeadline(time.Time{}) }()
+	}
+	written, err := io.WriteString(c.w, frame)
 	if err != nil {
 		return err
 	}
-	if written != builder.Len() {
+	if written != len(frame) {
 		return io.ErrShortWrite
 	}
 	return c.flush()
+}
+
+func writeField(builder *strings.Builder, name, value string) {
+	builder.WriteString(name)
+	builder.WriteByte(':')
+	// SSE parsers strip one leading space from a field value.
+	if strings.HasPrefix(value, " ") {
+		builder.WriteByte(' ')
+	}
+	builder.WriteString(value)
+	builder.WriteByte('\n')
 }
 
 func splitLines(value string) []string {
@@ -116,10 +154,17 @@ func splitLines(value string) []string {
 
 func (c *connection) Close() error {
 	c.mu.Lock()
-	c.closed = true
+	c.closeLocked(nil)
 	c.mu.Unlock()
-	c.closeOnce.Do(func() { close(c.done) })
 	return nil
+}
+
+func (c *connection) closeLocked(err error) {
+	if !c.closed {
+		c.closed = true
+		c.err = err
+		close(c.done)
+	}
 }
 
 func (c *connection) openStream() error {
@@ -131,20 +176,18 @@ func (c *connection) openStream() error {
 	// A flushed header-only response can still be buffered by reverse proxies.
 	// An empty SSE comment makes the stream observable without dispatching an
 	// application event to the client.
-	written, err := io.WriteString(c.w, ":\n\n")
-	if err != nil {
-		return err
-	}
-	if written != 3 {
-		return io.ErrShortWrite
-	}
-	return c.flush()
+	return c.writeFrame(":\n\n")
 }
 
 // Serve registers a net/http SSE connection and blocks until the request ends,
 // the configured timeout expires, or complete-after-message closes it.
+// A non-empty Last-Event-ID request header enables replay; explicit registration
+// options override that cursor. Disconnect preserves subscriptions and history.
 func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientID string, options ...Option) error {
 	configuration := config{timeout: 3 * time.Minute}
+	if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
+		configuration.registration = append(configuration.registration, sseeventbus.ReplayFrom(lastEventID))
+	}
 	for _, option := range options {
 		if option != nil {
 			option(&configuration)
@@ -155,6 +198,12 @@ func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientI
 	}
 	if err := r.Context().Err(); err != nil {
 		return err
+	}
+	ctx := r.Context()
+	if configuration.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, configuration.timeout)
+		defer cancel()
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	if w.Header().Get("Cache-Control") == "" {
@@ -173,26 +222,25 @@ func Serve(w http.ResponseWriter, r *http.Request, bus *sseeventbus.Bus, clientI
 		}
 		return nil
 	}
-	conn := &connection{w: w, flush: flush, requestDone: r.Context().Done(), done: make(chan struct{})}
-	if err := conn.openStream(); err != nil {
+	conn := &connection{
+		w: w, flush: flush, setWriteDeadline: controller.SetWriteDeadline,
+		writeTimeout: configuration.writeTimeout, requestDone: ctx.Done(), done: make(chan struct{}),
+	}
+	defer func() {
 		_ = conn.Close()
+		bus.Disconnect(clientID, conn)
+	}()
+	if err := conn.openStream(); err != nil {
 		return fmt.Errorf("open SSE stream: %w", err)
 	}
-	if err := bus.RegisterContext(r.Context(), clientID, conn, configuration.registration...); err != nil {
-		_ = conn.Close()
+	if err := bus.RegisterContext(ctx, clientID, conn, configuration.registration...); err != nil {
 		return err
 	}
-	var timeout <-chan time.Time
-	var timer *time.Timer
-	if configuration.timeout > 0 {
-		timer = time.NewTimer(configuration.timeout)
-		timeout = timer.C
-		defer timer.Stop()
-	}
 	select {
-	case <-r.Context().Done():
+	case <-ctx.Done():
 	case <-conn.done:
-	case <-timeout:
 	}
-	return conn.Close()
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
+	return conn.err
 }
