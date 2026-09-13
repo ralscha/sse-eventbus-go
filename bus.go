@@ -782,13 +782,11 @@ func (b *Bus) attempt(event *ClientEvent) bool {
 		// A publisher may hold this client's lifecycle lock while waiting for
 		// send queue capacity. Let the worker keep draining that queue while
 		// removal waits for the lock. At most one removal runs per generation.
-		b.wg.Add(1)
-		go func() {
-			defer b.wg.Done()
+		b.wg.Go(func() {
 			if b.unregister(event.ClientID, event.client, nil, false) {
 				b.notifyUnregistered([]string{event.ClientID})
 			}
-		}()
+		})
 	}
 	return false
 }
